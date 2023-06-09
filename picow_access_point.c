@@ -8,6 +8,7 @@
 
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
+#include "hardware/resets.h"
 
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
@@ -27,11 +28,13 @@
 #define POLL_TIME_S 5
 #define HTTP_GET "GET"
 #define HTTP_RESPONSE_HEADERS "HTTP/1.1 %d OK\nContent-Length: %d\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n"
-#define KNX_TEST_BODY "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><style>body{font-family: Arial, sans-serif; background-color: #f2f2f2; text-align: center;} h1{color: #333;} p{color: #666;} a{color: #007bff; text-decoration: none;} a:hover{color: #0056b3; text-decoration: underline;} @media (max-width: 480px) { body{padding: 20px;} h1{font-size: 24px;} p{font-size: 16px;} }</style></head><body><h1>KNX WiFi Switch.</h1><p>by Mateusz Zolisz 2023</p><p>KNX is %s</p><p><a href=\"?knx=%d\">Switch KNX %s</a></p></body></html>"
-#define KNX_PARAM "knx=%d"
-#define KNX_TEST "/knxtest"
+#define KNX_TEST_BODY "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><style>body{font-family: Arial, sans-serif; background-color: #f2f2f2; text-align: center;} h1{color: #333;} p{color: #666;} a{color: #007bff; text-decoration: none;} a:hover{color: #0056b3; text-decoration: underline;} @media (max-width: 480px) { body{padding: 20px;} h1{font-size: 24px;} p{font-size: 16px;} }</style></head><body><h1>KNX WiFi Switch.</h1><p>by Mateusz Zolisz 2023</p><p>KNX is %s</p><p><a href=\"/switch?switch=%d\">Switch KNX %s</a></p></body></html>"
+#define KNX_SWITCH_PARAM "switch=%d"
+#define KNX_SWITCH_REQUEST "/switch"
+#define KNX_TARGET_REQUEST "/target"
+#define KNX_TARGET_PARAM "main=%d&middle=%d&sub=%d"
 #define LED_GPIO 0
-#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" KNX_TEST "\n\n"
+#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" KNX_SWITCH_REQUEST "\n\n"
 
 // UART
 #define UART_ID uart1
@@ -60,6 +63,102 @@ typedef struct TCP_CONNECT_STATE_T_ {
 } TCP_CONNECT_STATE_T;
 
 static int knxState = 0;
+char knxTargetAddr[15] = "0.0.2";
+
+static bool sendKnxTelegram(const char telegram[], int messageSize) {
+    uint8_t sendbuf[2];
+    for (int i = 0; i < messageSize; i++) {
+        if (i == (messageSize - 1)) {
+            sendbuf[0] = TPUART_DATA_END;
+        }  else {
+            sendbuf[0] = TPUART_DATA_START_CONTINUE;
+        }
+
+        sendbuf[0] |= i;
+        sendbuf[1] = telegram[i];
+
+        uart_putc_raw(UART_ID, sendbuf[0]);
+        uart_putc_raw(UART_ID, sendbuf[1]);
+    }
+
+    return true;
+}
+
+static int server_content(const char *request, const char *params, char *result, size_t max_result_len) {
+    int len = 0;
+    DEBUG_printf("ADDR: %s \n", knxTargetAddr);
+    if (strncmp(request, KNX_SWITCH_REQUEST, sizeof(KNX_SWITCH_REQUEST) - 1) == 0) {
+        uint8_t telegram[9];
+        uint16_t data;
+        uint8_t checksum;
+        uint8_t controlByte = knxCreateControlField(false, "auto");
+        uint16_t sourceAddress = knxCreateSourceAddressFieldFromString("0.0.1");
+        uint16_t targetAddress = knxCreateTargetGroupAddressFieldFromString(knxTargetAddr);
+        uint8_t byte5 = 0x00;
+        knxSetTargetAddressType(&byte5, true);
+        knxSetRoutingCounter(&byte5, 6);  
+        knxSetDataLength(&byte5, 1);  
+
+        /* === Fill telegram === */
+        telegram[0] = controlByte;
+        telegram[1] = (sourceAddress >> 8) & 0x00FF;
+        telegram[2] = (sourceAddress & 0x00FF);
+        telegram[3] = (targetAddress >> 8) & 0x00FF;
+        telegram[4] = (targetAddress) & 0x00FF;
+        telegram[5] = byte5;
+        data = knxCreateDataSwitchField(KNX_CMD_VALUE_WRITE, !knxState);
+        telegram[6] = (data >> 8) & 0x00FF;
+        telegram[7] = data & 0x00FF;
+        telegram[8] = knxCalculateChecksum(telegram, sizeof(telegram)/sizeof(uint8_t));
+
+        if (params) {
+            int knxSwitchParam = sscanf(params, KNX_SWITCH_PARAM, &knxState);
+            if (knxSwitchParam == 1) {
+                if (knxState) {
+                    knxState = true;
+                } else {
+                    knxState = false;
+                }
+            }
+
+            bool sendTelegram = sendKnxTelegram(telegram, 9);
+            if (sendTelegram) {
+                cyw43_arch_gpio_put(LED_GPIO, knxState);
+            }
+        }
+
+        if (knxState) {
+            len = snprintf(result, max_result_len, KNX_TEST_BODY, "ON", 0, "OFF");
+        } else {
+            len = snprintf(result, max_result_len, KNX_TEST_BODY, "OFF", 1, "ON");
+        }
+    }
+
+    if (strncmp(request, KNX_TARGET_REQUEST, sizeof(KNX_TARGET_REQUEST) - 1) == 0) {
+        DEBUG_printf("TARGET REQUEST \n");
+        if (params) {
+            int main, middle, sub;
+            sscanf(params, KNX_TARGET_PARAM, &main, &middle, &sub);
+            DEBUG_printf("PARAMS: %s", params);
+            sprintf(knxTargetAddr, "%d.%d.%d", main, middle, sub);
+            for (size_t i = 0; i < 3; i++) {
+                cyw43_arch_gpio_put(LED_GPIO, !knxState);
+                sleep_ms(500);
+                cyw43_arch_gpio_put(LED_GPIO, knxState);
+                sleep_ms(500);
+            }
+            DEBUG_printf("ADDR: %s \n", knxTargetAddr);
+        }
+
+        if (knxState) {
+            len = snprintf(result, max_result_len, KNX_TEST_BODY, "ON", 0, "OFF");
+        } else {
+            len = snprintf(result, max_result_len, KNX_TEST_BODY, "OFF", 1, "ON");
+        }
+    }
+
+    return len;
+}
 
 static err_t tcp_close_client_connection(TCP_CONNECT_STATE_T *con_state, struct tcp_pcb *client_pcb, err_t close_err) {
     if (client_pcb) {
@@ -101,88 +200,6 @@ static err_t tcp_server_sent(void *arg, struct tcp_pcb *pcb, u16_t len) {
     return ERR_OK;
 }
 
-static bool sendKnxTelegram(const char telegram[], int messageSize) {
-    uint8_t sendbuf[2];
-    for (int i = 0; i < messageSize; i++) {
-        if (i == (messageSize - 1)) {
-            sendbuf[0] = TPUART_DATA_END;
-        }  else {
-            sendbuf[0] = TPUART_DATA_START_CONTINUE;
-        }
-
-        sendbuf[0] |= i;
-        sendbuf[1] = telegram[i];
-
-        uart_putc_raw(UART_ID, sendbuf[0]);
-        uart_putc_raw(UART_ID, sendbuf[1]);
-    }
-
-    return true;
-}
-
-static int test_server_content(const char *request, const char *params, char *result, size_t max_result_len) {
-    int len = 0;
-    if (strncmp(request, KNX_TEST, sizeof(KNX_TEST) - 1) == 0) {
-        DEBUG_printf("KNX SEND\n");
-        uint8_t telegram[9];
-
-        uint8_t controlByte = knxCreateControlField(false, "auto");
-
-        /* === Source Address === */
-        uint16_t sourceAddress = knxCreateSourceAddressFieldFromString("0.0.1");
-
-        /* === Target Address === */
-        uint16_t targetAddress = knxCreateTargetGroupAddressFieldFromString("0.0.2");
-
-        /* === Target type & Routing Counter === */
-        uint8_t byte5 = 0x00;
-        knxSetTargetAddressType(&byte5, true);
-        knxSetRoutingCounter(&byte5, 6);  
-        knxSetDataLength(&byte5, 1);  
-
-        /* === Data === */
-        uint16_t data;
-
-        /* === Checksum === */
-        uint8_t checksum;
-
-        /* === Fill telegram === */
-        telegram[0] = controlByte;
-        telegram[1] = (sourceAddress >> 8) & 0x00FF;
-        telegram[2] = (sourceAddress & 0x00FF);
-        telegram[3] = (targetAddress >> 8) & 0x00FF;
-        telegram[4] = (targetAddress) & 0x00FF;
-        telegram[5] = byte5;
-        data = knxCreateDataSwitchField(KNX_CMD_VALUE_WRITE, !knxState);
-        telegram[6] = (data >> 8) & 0x00FF;
-        telegram[7] = data & 0x00FF;
-        telegram[8] = knxCalculateChecksum(telegram, sizeof(telegram)/sizeof(uint8_t));
-
-        if (params) {
-            int knx_param = sscanf(params, KNX_PARAM, &knxState);
-            if (knx_param == 1) {
-                if (knxState) {
-                    knxState = true;
-                } else {
-                   knxState = false;
-                }
-            }
-
-            bool sendTelegram = sendKnxTelegram(telegram, 9);
-            if (sendTelegram) {
-                cyw43_arch_gpio_put(LED_GPIO, knxState);
-            }
-        }
-
-        if (knxState) {
-            len = snprintf(result, max_result_len, KNX_TEST_BODY, "ON", 0, "OFF");
-        } else {
-            len = snprintf(result, max_result_len, KNX_TEST_BODY, "OFF", 1, "ON");
-        }
-    }
-    return len;
-}
-
 err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     TCP_CONNECT_STATE_T *con_state = (TCP_CONNECT_STATE_T*)arg;
     if (!p) {
@@ -217,7 +234,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             }
 
             // Generate content
-            con_state->result_len = test_server_content(request, params, con_state->result, sizeof(con_state->result));
+            con_state->result_len = server_content(request, params, con_state->result, sizeof(con_state->result));
             DEBUG_printf("Request: %s?%s\n", request, params);
             DEBUG_printf("Result: %d\n", con_state->result_len);
 
@@ -357,14 +374,8 @@ int main() {
         DEBUG_printf("failed to initialise\n");
         return 1;
     }
-    const char *ap_name = AP_NAME;
-#if 1
-    const char *password = AP_PASSWORD;
-#else
-    const char *password = NULL;
-#endif
 
-    cyw43_arch_enable_ap_mode(ap_name, password, CYW43_AUTH_WPA2_AES_PSK);
+    cyw43_arch_enable_ap_mode(AP_NAME, AP_PASSWORD, CYW43_AUTH_WPA2_AES_PSK);
 
     ip4_addr_t mask;
     IP4_ADDR(ip_2_ip4(&state->gw), 192, 168, 4, 1);
@@ -403,5 +414,6 @@ int main() {
     dns_server_deinit(&dns_server);
     dhcp_server_deinit(&dhcp_server);
     cyw43_arch_deinit();
+
     return 0;
 }
