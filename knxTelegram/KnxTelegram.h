@@ -37,6 +37,10 @@
 #define KNX_CMD_VALUE_WRITE 0b00000010
 #define KNX_CMD_MEMORY_WRITE 0b00001010
 
+/* Used for communication with TPUART chip */
+#define TPUART_DATA_START_CONTINUE 0B10000000
+#define TPUART_DATA_END 0B01000000
+
 typedef struct {
   uint8_t area;
   uint8_t line;

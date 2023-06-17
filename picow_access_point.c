@@ -1,50 +1,68 @@
 /**
- * Copyright (c) 2022 Raspberry Pi (Trading) Ltd.
- *
- * SPDX-License-Identifier: BSD-3-Clause
+ * @file picow_access_point.c
+ * @author Mateusz Zolisz <mateusz.zolisz@gmail.com>
+ * @brief 
+ * @version 0.4
+ * @date 2023-06-15
+ * 
+ * @copyright Copyright (c) 2023
+ * 
  */
 
 #include <string.h>
-
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 #include "hardware/resets.h"
-
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
-
 #include "dhcpserver.h"
 #include "dnsserver.h"
-
 #include "hardware/uart.h"
-
 #include "knxTelegram.h"
 
 #define AP_NAME "Zolisz KNX Switch"
 #define AP_PASSWORD "password123"
+
+#define LED_GPIO 0
 
 #define TCP_PORT 80
 #define DEBUG_printf printf
 #define POLL_TIME_S 5
 #define HTTP_GET "GET"
 #define HTTP_RESPONSE_HEADERS "HTTP/1.1 %d OK\nContent-Length: %d\nContent-Type: text/html; charset=utf-8\nConnection: close\n\n"
-#define KNX_TEST_BODY "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><style>body{font-family: Arial, sans-serif; background-color: #f2f2f2; text-align: center;} h1{color: #333;} p{color: #666;} a{color: #007bff; text-decoration: none;} a:hover{color: #0056b3; text-decoration: underline;} @media (max-width: 480px) { body{padding: 20px;} h1{font-size: 24px;} p{font-size: 16px;} }</style></head><body><h1>KNX WiFi Switch.</h1><p>by Mateusz Zolisz 2023</p><p>KNX is %s</p><p><a href=\"/switch?switch=%d\">Switch KNX %s</a></p></body></html>"
-#define KNX_SWITCH_PARAM "switch=%d"
-#define KNX_SWITCH_REQUEST "/switch"
-#define KNX_TARGET_REQUEST "/target"
-#define KNX_TARGET_PARAM "main=%d&middle=%d&sub=%d"
-#define LED_GPIO 0
-#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s" KNX_SWITCH_REQUEST "\n\n"
+#define HTTP_RESPONSE_REDIRECT "HTTP/1.1 302 Redirect\nLocation: http://%s\n\n"
 
-// UART
+#define KNX_SOURCE_ADDRESS "0.0.1"
+#define KNX_DEFAULT_TARGET_ADDRESS "0.0.2"
+
+/**
+ * WebServer Routes with Params
+ */
+#define KNX_SWITCH_ROUTE "/switch"
+#define KNX_SWITCH_PARAM "value=%d"
+#define KNX_TARGET_ROUTE "/target"
+#define KNX_TARGET_PARAM "main=%d&middle=%d&sub=%d"
+#define KNX_DIMMING_ROUTE "/dimming"
+#define KNX_DIMMING_PARAM "value=%d"
+
+/**
+ * WebServer Templates
+ */
+#define TEMPLATE_HEADER "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><style>body{font-family: Arial, sans-serif; background-color: #f2f2f2; text-align: center;} h1{color: #333;} p{color: #666;} a{color: #007bff; text-decoration: none;} a:hover{color: #0056b3; text-decoration: underline;} input{border-radius: 4px; padding: 4px;} @media (max-width: 480px) { body{padding: 20px;} h{font-size: 24px;} p{font-size: 16px;} }</style></head><body><h1>KNX WiFi Switch.</h1><p>by Mateusz Zolisz 2023</p><p><a href=\"" KNX_SWITCH_ROUTE "\">Switch</a> | <a href=\"" KNX_TARGET_ROUTE "\">Target</a> | <a href=\"" KNX_DIMMING_ROUTE "\">Dimming</a></p></br>"
+
+#define TEMPLATE_SWITCH_BODY TEMPLATE_HEADER "<p><a href=\"" KNX_SWITCH_ROUTE "?" KNX_SWITCH_PARAM "\"><button>Switch KNX %s</button></a></p></body></html>"
+
+#define TEMPLATE_ADDRESS_BODY TEMPLATE_HEADER "<form action=\"" KNX_TARGET_ROUTE "\"><label for=\"main\">Main</label></br><input type=\"number\" id=\"main\" name=\"main\" value=\"%d\" placeholder=\"main\" required><br><br><label for=\"middle\">Middle</label></br><input type=\"number\" name=\"middle\" id=\"middle\" placeholder=\"middle\" value=\"%d\" required><br><br><label for=\"sub\">Sub</label></br><input type=\"number\" id=\"sub\" name=\"sub\" value=\"%d\" placeholder=\"sub\" required><br><br><input type=\"submit\" value=\"Change Address\"></form></body></html>"
+
+#define TEMPLATE_DIMMING_BODY TEMPLATE_HEADER "<form action=\"" KNX_DIMMING_ROUTE "\"><label for=\"value\">Value (0-255)</label></br><input type=\"number\" min=0 max=255 id=\"value\" name=\"value\" value=\"%d\" placeholder=\"value\" required style=\"width: 100px\"><br><br><input type=\"submit\" value=\"Set Dimmer\"></form></body></html>"
+
+/**
+ * UART Settings
+ */
 #define UART_ID uart1
 #define BAUD_RATE 19200
 #define UART_TX_PIN 4
 #define UART_RX_PIN 5
-
-// Services to TPUART
-#define TPUART_DATA_START_CONTINUE 0B10000000
-#define TPUART_DATA_END 0B01000000
 
 typedef struct TCP_SERVER_T_ {
     struct tcp_pcb *server_pcb;
@@ -56,14 +74,15 @@ typedef struct TCP_CONNECT_STATE_T_ {
     struct tcp_pcb *pcb;
     int sent_len;
     char headers[128];
-    char result[1024];
+    char result[2048];
     int header_len;
     int result_len;
     ip_addr_t *gw;
 } TCP_CONNECT_STATE_T;
 
 static int knxState = 0;
-char knxTargetAddr[15] = "0.0.2";
+static int knxDimmingValue = 0;
+char knxTargetAddr[11] = KNX_DEFAULT_TARGET_ADDRESS;
 
 static bool sendKnxTelegram(const char telegram[], int messageSize) {
     uint8_t sendbuf[2];
@@ -84,15 +103,26 @@ static bool sendKnxTelegram(const char telegram[], int messageSize) {
     return true;
 }
 
+void blinkLed(uint8_t count, uint time) {
+    for (size_t i = 0; i < count; i++) {
+        cyw43_arch_gpio_put(LED_GPIO, !knxState);
+        sleep_ms(time);
+        cyw43_arch_gpio_put(LED_GPIO, knxState);
+        sleep_ms(time);
+    }
+}
+
 static int server_content(const char *request, const char *params, char *result, size_t max_result_len) {
     int len = 0;
-    DEBUG_printf("ADDR: %s \n", knxTargetAddr);
-    if (strncmp(request, KNX_SWITCH_REQUEST, sizeof(KNX_SWITCH_REQUEST) - 1) == 0) {
+   
+    /* Default Route */
+    if (strncmp(request, KNX_SWITCH_ROUTE, sizeof(KNX_SWITCH_ROUTE) - 1) == 0 
+        || strncmp(request, "/", 1) == 0) {
         uint8_t telegram[9];
         uint16_t data;
         uint8_t checksum;
         uint8_t controlByte = knxCreateControlField(false, "auto");
-        uint16_t sourceAddress = knxCreateSourceAddressFieldFromString("0.0.1");
+        uint16_t sourceAddress = knxCreateSourceAddressFieldFromString(KNX_SOURCE_ADDRESS);
         uint16_t targetAddress = knxCreateTargetGroupAddressFieldFromString(knxTargetAddr);
         uint8_t byte5 = 0x00;
         knxSetTargetAddressType(&byte5, true);
@@ -128,36 +158,62 @@ static int server_content(const char *request, const char *params, char *result,
         }
 
         if (knxState) {
-            len = snprintf(result, max_result_len, KNX_TEST_BODY, "ON", 0, "OFF");
+            return snprintf(result, max_result_len, TEMPLATE_SWITCH_BODY, 0, "OFF");
         } else {
-            len = snprintf(result, max_result_len, KNX_TEST_BODY, "OFF", 1, "ON");
+            return snprintf(result, max_result_len, TEMPLATE_SWITCH_BODY, 1, "ON");
         }
     }
 
-    if (strncmp(request, KNX_TARGET_REQUEST, sizeof(KNX_TARGET_REQUEST) - 1) == 0) {
-        DEBUG_printf("TARGET REQUEST \n");
+    if (strncmp(request, KNX_DIMMING_ROUTE, sizeof(KNX_DIMMING_ROUTE) - 1) == 0) {
         if (params) {
-            int main, middle, sub;
-            sscanf(params, KNX_TARGET_PARAM, &main, &middle, &sub);
-            DEBUG_printf("PARAMS: %s", params);
-            sprintf(knxTargetAddr, "%d.%d.%d", main, middle, sub);
-            for (size_t i = 0; i < 3; i++) {
-                cyw43_arch_gpio_put(LED_GPIO, !knxState);
-                sleep_ms(500);
-                cyw43_arch_gpio_put(LED_GPIO, knxState);
-                sleep_ms(500);
+            sscanf(params, KNX_DIMMING_PARAM, &knxDimmingValue);
+
+            uint8_t telegram[10];
+            uint32_t data = knxCreateDataDimmingField(KNX_CMD_VALUE_WRITE, knxDimmingValue);
+            uint8_t checksum;
+            uint8_t controlByte = knxCreateControlField(false, "auto");
+            uint16_t sourceAddress = knxCreateSourceAddressFieldFromString(KNX_SOURCE_ADDRESS);
+            uint16_t targetAddress = knxCreateTargetGroupAddressFieldFromString(knxTargetAddr);
+            uint8_t byte5 = 0x00;
+            knxSetTargetAddressType(&byte5, true);
+            knxSetRoutingCounter(&byte5, 6);  
+            knxSetDataLength(&byte5, 1);  
+
+            /* === Fill telegram === */
+            telegram[0] = controlByte;
+            telegram[1] = (sourceAddress >> 8) & 0x00FF;
+            telegram[2] = (sourceAddress & 0x00FF);
+            telegram[3] = (targetAddress >> 8) & 0x00FF;
+            telegram[4] = (targetAddress) & 0x00FF;
+            telegram[5] = byte5;
+            telegram[6] = (data >> 16) & 0x00FF;
+            telegram[7] = (data >> 8) & 0x00FF;
+            telegram[8] = data & 0x00FF;
+            telegram[9] = knxCalculateChecksum(telegram, sizeof(telegram)/sizeof(uint8_t));
+
+            bool sendTelegram = sendKnxTelegram(telegram, 10);
+
+            if (sendTelegram) {
+                blinkLed(10, 30);
             }
-            DEBUG_printf("ADDR: %s \n", knxTargetAddr);
         }
 
-        if (knxState) {
-            len = snprintf(result, max_result_len, KNX_TEST_BODY, "ON", 0, "OFF");
-        } else {
-            len = snprintf(result, max_result_len, KNX_TEST_BODY, "OFF", 1, "ON");
-        }
+        return snprintf(result, max_result_len, TEMPLATE_DIMMING_BODY, knxDimmingValue);
     }
 
-    return len;
+    if (strncmp(request, KNX_TARGET_ROUTE, sizeof(KNX_TARGET_ROUTE) - 1) == 0) {
+        int main, middle, sub;
+        if (params) {
+            sscanf(params, KNX_TARGET_PARAM, &main, &middle, &sub);
+            sprintf(knxTargetAddr, "%d.%d.%d", main, middle, sub);
+            blinkLed(3, 100);
+            DEBUG_printf("ADDR: %s \n", knxTargetAddr);
+        } else {
+            sscanf(knxTargetAddr, "%d.%d.%d", &main, &middle, &sub);
+        }
+
+        return snprintf(result, max_result_len, TEMPLATE_ADDRESS_BODY, main, middle, sub);
+    }
 }
 
 static err_t tcp_close_client_connection(TCP_CONNECT_STATE_T *con_state, struct tcp_pcb *client_pcb, err_t close_err) {
@@ -209,11 +265,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
     assert(con_state && con_state->pcb == pcb);
     if (p->tot_len > 0) {
         DEBUG_printf("tcp_server_recv %d err %d\n", p->tot_len, err);
-#if 0
-        for (struct pbuf *q = p; q != NULL; q = q->next) {
-            DEBUG_printf("in: %.*s\n", q->len, q->payload);
-        }
-#endif
+
         // Copy the request into the buffer
         pbuf_copy_partial(p, con_state->headers, p->tot_len > sizeof(con_state->headers) - 1 ? sizeof(con_state->headers) - 1 : p->tot_len, 0);
 

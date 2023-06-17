@@ -420,11 +420,11 @@ uint16_t knxCreateDataSwitchField(uint8_t cmd, bool state) {
 }
 
 /**
- * @brief Create 3 bytes for switch data
+ * @brief Create 3 bytes for dimming data
  * First 1 most significiant byte has no evaluation
  * @param cmd 
- * @param state (on/off)
- * @return uint16_t 
+ * @param value (0-255)
+ * @return uint32_t 
  */
 uint32_t knxCreateDataDimmingField(uint8_t cmd, uint8_t value) {
   uint32_t field = 0;
