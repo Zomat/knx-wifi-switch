@@ -17,6 +17,7 @@ add_executable(picow_access_point_background
         dhcpserver/dhcpserver.c
         dnsserver/dnsserver.c
         knxTelegram/KnxTelegram.c
+        server.c
         )
 
 target_include_directories(picow_access_point_background PRIVATE
@@ -39,6 +40,7 @@ add_executable(picow_access_point_poll
         dhcpserver/dhcpserver.c
         dnsserver/dnsserver.c
         knxTelegram/KnxTelegram.c
+        server.c
         )
 target_include_directories(picow_access_point_poll PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
