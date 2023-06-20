@@ -54,11 +54,6 @@
 #define UART_TX_PIN 4
 #define UART_RX_PIN 5
 
-struct Route {
-    char* route;
-    void (*controller)(void);
-};
-
 static int knxState = 0;
 static int knxDimmingValue = 0;
 char knxTargetAddr[11] = KNX_DEFAULT_TARGET_ADDRESS;
